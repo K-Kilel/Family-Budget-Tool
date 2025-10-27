@@ -1,0 +1,10 @@
+{
+  "identifier": "storage",
+  "description": "Allow SQLite load + basic path/fs APIs",
+  "permissions": [
+    "sql:default",
+    "sql:allow-load",
+    "path:default",
+    "fs:default"
+  ]
+}
