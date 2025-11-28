@@ -38,8 +38,13 @@ import {
   signIn, signUp, getUser, signOut,
   ensureWorkspace,
   listAccountsSupabase, addAccountSupabase,
-  addTransactionSupabase, listTransactionsSupabase,
+  addTransactionSupabase, listTransactionsSupabase, deleteTransactionSupabase, updateTransactionSupabase,
+  addTransferSupabase, listTransfersSupabase, updateTransferSupabase, deleteTransferSupabase,
+  addProjectSupabase, listProjectsSupabase, deleteProjectSupabase,
+  addProjectContributionSupabase, listProjectContributionsSupabase, deleteProjectContributionSupabase,
+  addInvestmentSupabase, listInvestmentsSupabase, deleteInvestmentSupabase,
 } from "@/lib/supa-helpers";
+import type { NewTransaction, NewAccount, NewTransfer, NewProject, NewProjectContribution } from "@/lib/supa-helpers";
 
 /* ===========================
    Types
@@ -56,12 +61,21 @@ type Income = {
   notes?: string;
 };
 
+type RecurrencePeriod = "monthly" | "quarterly" | "annually"; // (extendable later)
+type Recurrence = {
+  enabled: boolean;
+  period: RecurrencePeriod;
+  start: string;       // ISO date
+  end?: string;        // ISO date
+};
+
 type Expense = {
   id: Id;
   date: string;
   category: string;
   amount: number;
-  isRecurring: boolean;
+  isRecurring: boolean;         // legacy toggle (still surfaced)
+  recurrence?: Recurrence;      // NEW: structured recurrence
   accountId: Id;
   notes?: string;
 };
@@ -100,6 +114,15 @@ type AccountTxn = {
 type Project = { id: Id; name: string; targetAmount: number; targetDate: string; notes?: string };
 type ProjectContribution = { id: Id; projectId: Id; date: string; amount: number };
 
+type Investment = {
+  id: Id;
+  date: string;               // ISO date
+  instrument: string;         // e.g., "MMF", "ETF", "Bonds"
+  amount: number;             // +contribution, -withdrawal
+  accountId?: Id;             // optional: which account funded/received
+  notes?: string;
+};
+
 type Store = {
   currency: Currency;
   incomes: Income[];
@@ -109,17 +132,19 @@ type Store = {
   accountTxns: AccountTxn[]; // auto-maintained
   projects: Project[];
   projectContribs: ProjectContribution[];
+  investments: Investment[]; // NEW
 };
 
-const LS_KEY = "budgeting-tool-mvp-v1";
+const LS_KEY = "budgeting-tool-mvp-v2";
 
 /* ===========================
    Utils
 =========================== */
-const mkId = () =>
-  typeof crypto !== "undefined" && typeof (crypto as any).randomUUID === "function"
-    ? (crypto as any).randomUUID()
-    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+const mkId = () => {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+};
 
 const emptyStore: Store = {
   currency: "USD",
@@ -130,6 +155,7 @@ const emptyStore: Store = {
   accountTxns: [],
   projects: [],
   projectContribs: [],
+  investments: [],
 };
 
 const fmt = (n: number, c: Currency) =>
@@ -146,6 +172,7 @@ const monthNameFromYM = (ym: string) => {
   if (!m) return ym;
   return MONTH_LABELS[m - 1];
 };
+const WORKSPACE_ID_OVERRIDE = process.env.NEXT_PUBLIC_SUPABASE_WORKSPACE_ID || null;
 const monthIndexFromName = (name: string) =>
   MONTH_LABELS.findIndex((m) => m.toLowerCase() === name.toLowerCase()); // 0-based
 
@@ -173,6 +200,48 @@ function fmtMonth(d: Date) {
 function monthKeyFromDate(d: Date) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
+function firstOfMonthFromYM(ym: string) {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(y, (m || 1) - 1, 1);
+}
+function monthsDiff(a: string, b: string) {
+  // a,b are YYYY-MM
+  const [ya, ma] = a.split("-").map(Number);
+  const [yb, mb] = b.split("-").map(Number);
+  return (yb - ya) * 12 + (mb - ma);
+}
+function inRangeMonth(ym: string, startISO: string, endISO?: string) {
+  const sYM = ymKey(startISO);
+  const eYM = endISO ? ymKey(endISO) : undefined;
+  if (!sYM) return false;
+  if (eYM && ym > eYM) return false;
+  return ym >= sYM;
+}
+function recurrenceOccursThisMonth(exp: Expense, ym: string): boolean {
+  const r = exp.recurrence;
+  const enabled = r?.enabled || exp.isRecurring;
+  if (!enabled) return false;
+
+  const anchorISO = r?.start || exp.date;
+  if (!inRangeMonth(ym, anchorISO, r?.end)) return false;
+
+  const diff = monthsDiff(ymKey(anchorISO), ym);
+  const period = r?.period || "monthly";
+  if (diff < 0) return false;
+
+  switch (period) {
+    case "monthly":
+      return true;
+    case "quarterly":
+      return diff % 3 === 0;
+    case "annually":
+      return diff % 12 === 0;
+    default:
+      return false;
+  }
+}
+
+/* UI: Month switcher */
 function MonthSwitcher({ value, onChange }: { value: Date; onChange: (d: Date) => void }) {
   return (
     <div className="flex items-center gap-2">
@@ -214,8 +283,9 @@ export default function Page() {
     const ys = new Set<string>();
     store.incomes.forEach((i) => { const y = yearFrom(i.date); if (y) ys.add(y); });
     store.expenses.forEach((e) => { const y = yearFrom(e.date); if (y) ys.add(y); });
+    store.investments.forEach((v) => { const y = yearFrom(v.date); if (y) ys.add(y); });
     return Array.from(ys).sort();
-  }, [store.incomes, store.expenses]);
+  }, [store.incomes, store.expenses, store.investments]);
 
   const [chartYear, setChartYear] = useState<string>(
     allYearsInData.includes(currentYear) ? currentYear : allYearsInData[0] || currentYear
@@ -234,32 +304,391 @@ export default function Page() {
     }
   }, [store]);
 
+  // Cloud (Supabase) state
+  const ENABLE_CLOUD = true;
+  const ENABLE_LOCAL_DB = false;
+  const [workspaceId, setWorkspaceId] = useState<string | null>(null);
+  const [cloudOn, setCloudOn] = useState<boolean>(false);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [cloudLoading, setCloudLoading] = useState<boolean>(false);
+  const [deriveBalances, setDeriveBalances] = useState<boolean>(true);
+  const [authChecking, setAuthChecking] = useState<boolean>(true);
+  const [hydrated, setHydrated] = useState<boolean>(false);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+
+  // Hydrate data from local SQLite via API
+  const hydrateFromLocalDb = async () => {
+    const res = await fetch('/api/snapshot', { cache: 'no-store' });
+    const data = await res.json();
+    // Map DB rows to store types
+    const accounts: Account[] = (data.accounts || []).map((a: any) => ({ id: a.id, name: a.name, type: a.type, balance: Number(a.balance||0), currency: a.currency }));
+    const incomes: Income[] = (data.transactions || []).filter((t: any)=> Number(t.amount) > 0).map((t: any) => ({ id: t.id, date: t.trx_date, source: t.description || '', amount: Number(t.amount), accountId: t.account_id }));
+    const expenses: Expense[] = (data.transactions || []).filter((t: any)=> Number(t.amount) < 0).map((t: any) => ({ id: t.id, date: t.trx_date, category: t.description || 'Expense', amount: Math.abs(Number(t.amount)), isRecurring: false, accountId: t.account_id }));
+    const transfers: Transfer[] = (data.transfers || []).map((t: any) => ({ id: t.id, date: t.trx_date, fromAccountId: t.from_account_id, toAccountId: t.to_account_id, amount: Number(t.amount), notes: t.notes || undefined }));
+    const investments: Investment[] = (data.investments || []).map((v: any) => ({ id: v.id, date: v.inv_date, instrument: v.instrument, amount: Number(v.amount), accountId: v.account_id || undefined, notes: v.notes || undefined }));
+    const projects: Project[] = (data.projects || []).map((p: any) => ({ id: p.id, name: p.name, targetAmount: Number(p.target_amount), targetDate: p.target_date, notes: p.notes || undefined }));
+    const projectContribs: ProjectContribution[] = (data.project_contributions || []).map((c: any) => ({ id: c.id, projectId: c.project_id, date: c.date, amount: Number(c.amount) }));
+
+    // Derive accountTxns
+    const accountTxns: AccountTxn[] = [
+      ...incomes.map((i) => ({ id: mkId(), date: i.date, accountId: i.accountId, type: 'Deposit' as const, amount: i.amount, linkedType: 'Income' as const, linkedId: i.id, notes: i.source || 'Income' })),
+      ...expenses.map((e) => ({ id: mkId(), date: e.date, accountId: e.accountId, type: 'Withdrawal' as const, amount: e.amount, linkedType: 'Expense' as const, linkedId: e.id, notes: e.category || 'Expense' })),
+      ...transfers.flatMap((t) => ([
+        { id: mkId(), date: t.date, accountId: t.fromAccountId, type: 'Withdrawal' as const, amount: t.amount, linkedType: 'Transfer' as const, linkedId: t.id, notes: t.notes || 'Transfer', transferFromId: t.fromAccountId, transferToId: t.toAccountId },
+        { id: mkId(), date: t.date, accountId: t.toAccountId, type: 'Deposit' as const, amount: t.amount, linkedType: 'Transfer' as const, linkedId: t.id, notes: t.notes || 'Transfer', transferFromId: t.fromAccountId, transferToId: t.toAccountId },
+      ])),
+      ...investments.filter(v=>!!v.accountId).map((v)=> ({ id: mkId(), date: v.date, accountId: v.accountId!, type: v.amount>0? 'Withdrawal' as const : 'Deposit' as const, amount: Math.abs(v.amount), linkedType: 'Expense' as const, linkedId: v.id, notes: v.instrument || 'Investment' })),
+    ].sort((a,b)=> b.date.localeCompare(a.date));
+
+    setStore((prev)=> ({ ...prev, accounts, incomes, expenses, transfers, investments, projects, projectContribs, accountTxns }));
+  };
+  const hydrateFromSupabase = async (wsId: string) => {
+    try {
+      setCloudLoading(true);
+      const [acctRows, txRows, trRows, invRows, projRows, contribRows] = await Promise.all([
+        listAccountsSupabase(wsId),
+        listTransactionsSupabase(wsId, 1000),
+        listTransfersSupabase(wsId),
+        listInvestmentsSupabase(wsId),
+        listProjectsSupabase(wsId),
+        listProjectContributionsSupabase(wsId),
+      ]);
+
+      type SBAccountRow = { id: string; name: string; type: Account["type"]; currency: string; balance: number | null };
+      const accountsCloud: Account[] = (acctRows as SBAccountRow[]).map((a) => ({
+        id: a.id,
+        name: a.name,
+        type: a.type,
+        currency: (a.currency === "KSH" ? "KSH" : "USD") as Currency,
+        balance: Number(a.balance ?? 0),
+      }));
+
+      type SBTrxRow = { id: string; trx_date: string; amount: number; description?: string | null; account_id: string };
+      const incomesCloud: Income[] = (txRows as SBTrxRow[])
+        .filter((t) => Number(t.amount) > 0)
+        .map((t) => ({
+          id: t.id,
+          date: t.trx_date,
+          source: t.description ?? "",
+          amount: Number(t.amount),
+          accountId: t.account_id,
+          notes: undefined,
+        }));
+
+      const expensesCloud: Expense[] = (txRows as SBTrxRow[])
+        .filter((t) => Number(t.amount) < 0)
+        .map((t) => ({
+          id: t.id,
+          date: t.trx_date,
+          category: t.description ?? "Expense",
+          amount: Math.abs(Number(t.amount)),
+          isRecurring: false,
+          accountId: t.account_id,
+          notes: undefined,
+        }));
+
+      // Derive account transactions from incomes/expenses
+      const transfersCloud: Transfer[] = (trRows as { id: string; trx_date: string; from_account_id: string; to_account_id: string; amount: number; notes?: string | null }[]).map((t) => ({
+        id: t.id,
+        date: t.trx_date,
+        fromAccountId: t.from_account_id,
+        toAccountId: t.to_account_id,
+        amount: Number(t.amount),
+        notes: t.notes ?? undefined,
+      }));
+
+      const investmentsCloud: Investment[] = (invRows as { id: string; inv_date: string; instrument: string; amount: number; account_id?: string | null; notes?: string | null }[]).map((v) => ({
+        id: v.id,
+        date: v.inv_date,
+        instrument: v.instrument,
+        amount: Number(v.amount),
+        accountId: v.account_id ?? undefined,
+        notes: v.notes ?? undefined,
+      }));
+
+      const projectsCloud: Project[] = (projRows as { id: string; name: string; target_amount: number; target_date: string; notes?: string | null }[]).map((p) => ({
+        id: p.id,
+        name: p.name,
+        targetAmount: Number(p.target_amount),
+        targetDate: p.target_date,
+        notes: p.notes ?? undefined,
+      }));
+
+      const projectContribsCloud: ProjectContribution[] = (contribRows as { id: string; project_id: string; date: string; amount: number }[]).map((c) => ({
+        id: c.id,
+        projectId: c.project_id,
+        date: c.date,
+        amount: Number(c.amount),
+      }));
+
+      // Build new store based on cloud + previous local data
+      setStore((prev) => {
+        const mergeById = <T extends { id: string }>(cloud: T[], local: T[]) => {
+          const ids = new Set(cloud.map((x) => x.id));
+          return [...cloud, ...local.filter((x) => !ids.has(x.id))];
+        };
+
+        const accounts = mergeById(accountsCloud, prev.accounts);
+        const incomes = mergeById(incomesCloud, prev.incomes);
+        const expenses = mergeById(expensesCloud, prev.expenses);
+        const transfers = mergeById(transfersCloud, prev.transfers);
+        const investments = mergeById(investmentsCloud, prev.investments);
+        const projects = mergeById(projectsCloud, prev.projects);
+        const projectContribs = mergeById(projectContribsCloud, prev.projectContribs);
+
+        const accountTxns: AccountTxn[] = [
+          ...incomes.map((i) => ({
+            id: mkId(),
+            date: i.date,
+            accountId: i.accountId,
+            type: "Deposit" as const,
+            amount: i.amount,
+            linkedType: "Income" as const,
+            linkedId: i.id,
+            notes: i.source || "Income",
+          })),
+          ...expenses.map((e) => ({
+            id: mkId(),
+            date: e.date,
+            accountId: e.accountId,
+            type: "Withdrawal" as const,
+            amount: e.amount,
+            linkedType: "Expense" as const,
+            linkedId: e.id,
+            notes: e.category || "Expense",
+          })),
+          ...transfers.flatMap((t) => [
+            {
+              id: mkId(),
+              date: t.date,
+              accountId: t.fromAccountId,
+              type: "Withdrawal" as const,
+              amount: t.amount,
+              linkedType: "Transfer" as const,
+              linkedId: t.id,
+              notes: t.notes || "Transfer",
+              transferFromId: t.fromAccountId,
+              transferToId: t.toAccountId,
+            },
+            {
+              id: mkId(),
+              date: t.date,
+              accountId: t.toAccountId,
+              type: "Deposit" as const,
+              amount: t.amount,
+              linkedType: "Transfer" as const,
+              linkedId: t.id,
+              notes: t.notes || "Transfer",
+              transferFromId: t.fromAccountId,
+              transferToId: t.toAccountId,
+            },
+          ]),
+          ...investments
+            .filter((v) => !!v.accountId)
+            .map((v) => ({
+              id: mkId(),
+              date: v.date,
+              accountId: v.accountId!,
+              type: v.amount > 0 ? ("Withdrawal" as const) : ("Deposit" as const),
+              amount: Math.abs(v.amount),
+              linkedType: "Expense" as const,
+              linkedId: v.id,
+              notes: v.instrument || "Investment",
+            })),
+        ].sort((a, b) => b.date.localeCompare(a.date));
+
+        // Optionally derive balances from activity
+        let accountsForStore = accounts;
+        if (deriveBalances) {
+          const map = new Map<string, number>();
+          accounts.forEach((a) => map.set(a.id, 0));
+          incomes.forEach((i) => map.set(i.accountId, (map.get(i.accountId) || 0) + i.amount));
+          expenses.forEach((e) => map.set(e.accountId, (map.get(e.accountId) || 0) - e.amount));
+          transfers.forEach((t) => {
+            map.set(t.fromAccountId, (map.get(t.fromAccountId) || 0) - t.amount);
+            map.set(t.toAccountId, (map.get(t.toAccountId) || 0) + t.amount);
+          });
+          investments.forEach((v) => {
+            if (!v.accountId) return;
+            const delta = v.amount > 0 ? -Math.abs(v.amount) : Math.abs(v.amount);
+            map.set(v.accountId, (map.get(v.accountId) || 0) + delta);
+          });
+          accountsForStore = accounts.map((a) => ({ ...a, balance: +(map.get(a.id) || 0).toFixed(2) }));
+        }
+
+        return {
+          ...prev,
+          accounts: accountsForStore,
+          incomes,
+          expenses,
+          transfers,
+          investments,
+          projects,
+          projectContribs,
+          accountTxns,
+        };
+      });
+    } finally {
+      setCloudLoading(false);
+    }
+  };
+
+  // Ensure we use a Supabase account id for transactions when Cloud is On
+  async function ensureCloudAccountId(wsId: string, localAccountId: Id): Promise<string> {
+    const local = store.accounts.find((a) => a.id === localAccountId);
+    if (!local) throw new Error("Selected account not found");
+    const accts = await listAccountsSupabase(wsId) as { id: string; name: string; type: Account["type"]; currency: string }[];
+    // If the local id already matches a cloud id, use it
+    if (accts.some((a) => a.id === localAccountId)) return localAccountId;
+    // Try match by name+type+currency
+    const match = accts.find((a) => a.name === local.name && a.type === local.type && a.currency === local.currency);
+    if (match) return match.id;
+    // Create and fetch again
+    await addAccountSupabase(wsId, { name: local.name, type: local.type, currency: local.currency, balance: local.balance } as NewAccount);
+    const accts2 = await listAccountsSupabase(wsId) as { id: string; name: string; type: Account["type"]; currency: string }[];
+    const created = accts2.find((a) => a.name === local.name && a.type === local.type && a.currency === local.currency);
+    if (!created) throw new Error("Failed to resolve cloud account");
+    return created.id;
+  }
+
+  // (Removed import/migration helpers to revert to pre-import behavior)
+
+  // Supabase bootstrap after auth
+  const bootstrapSupabase = async () => {
+    setCloudError(null);
+    try {
+      setCloudLoading(true);
+      const u = await getUser();
+      if (!u) {
+        setCloudOn(false);
+        setWorkspaceId(null);
+        setUserEmail(null);
+        return null;
+      }
+      setUserEmail(u.email ?? null);
+      // If caller provided a workspace id, use it and avoid inserting (prevents stack depth errors)
+      if (WORKSPACE_ID_OVERRIDE) {
+        setWorkspaceId(WORKSPACE_ID_OVERRIDE);
+        setCloudOn(true);
+        await hydrateFromSupabase(WORKSPACE_ID_OVERRIDE);
+        return WORKSPACE_ID_OVERRIDE;
+      }
+      const wsId = await ensureWorkspace("My Budget");
+      setWorkspaceId(wsId);
+      setCloudOn(true);
+      await hydrateFromSupabase(wsId);
+      return wsId;
+    } catch (e: any) {
+      console.warn("Supabase bootstrap failed:", e);
+      setCloudOn(false);
+      setWorkspaceId(null);
+      setCloudError(e?.message || String(e));
+      return null;
+    } finally {
+      setCloudLoading(false);
+    }
+  };
+
+  // Initial auth check + bootstrap
+  useEffect(() => {
+    setHydrated(true);
+    if (ENABLE_LOCAL_DB) {
+      hydrateFromLocalDb();
+      setAuthChecking(false);
+      return;
+    }
+    if (!ENABLE_CLOUD) {
+      setAuthChecking(false);
+      return;
+    }
+    (async () => {
+      try {
+        const u = await getUser();
+        if (!u) {
+          setCloudOn(false);
+          setWorkspaceId(null);
+          setUserEmail(null);
+          return;
+        }
+        setUserEmail(u.email ?? null);
+        await bootstrapSupabase();
+      } finally {
+        setAuthChecking(false);
+      }
+    })();
+  }, [ENABLE_CLOUD, ENABLE_LOCAL_DB]);
+
   // Derived values
   const currency = store.currency;
+
   const incomeThisMonth = useMemo(
     () => store.incomes.filter((i) => ymKey(i.date) === month).reduce((s, i) => s + i.amount, 0),
     [store, month]
   );
-  const expenseThisMonth = useMemo(
-    () => store.expenses.filter((e) => ymKey(e.date) === month).reduce((s, e) => s + e.amount, 0),
-    [store, month]
-  );
-  const projectedRecurringMonthly = useMemo(
-    () => store.expenses.filter((e) => e.isRecurring).reduce((s, e) => s + e.amount, 0),
-    [store]
-  );
-  const netThisMonth = +(incomeThisMonth - expenseThisMonth).toFixed(2);
 
+  // For the Expenses tab: real + projected recurring for visualisation
+  const monthExpensesReal = useMemo(
+    () => store.expenses.filter((e) => ymKey(e.date) === month),
+    [store.expenses, month]
+  );
+
+  const monthExpensesProjectedOnly = useMemo(() => {
+    // Build synthetic rows for recurring expenses that should appear this month but don't have an entry this month
+    const projected: Expense[] = [];
+    const seenReal = new Set(store.expenses.filter(e => ymKey(e.date) === month).map(e => e.id));
+
+    store.expenses.forEach((e) => {
+      if (!recurrenceOccursThisMonth(e, month)) return;
+      // If the original expense itself is dated this month, it's already in real set.
+      // Otherwise add a projected row with a synthetic id.
+      if (ymKey(e.date) !== month) {
+        projected.push({
+          ...e,
+          id: `${e.id}__proj__${month}`,
+          date: new Date(
+            firstOfMonthFromYM(month).getFullYear(),
+            firstOfMonthFromYM(month).getMonth(),
+            Math.min(28, new Date(e.date).getDate() || 1)
+          )
+            .toISOString()
+            .slice(0, 10),
+          notes: (e.notes ? `${e.notes} • ` : "") + "(Projected)",
+        });
+      }
+    });
+
+    // Avoid any accidental duplicates by category/amount/account when a manual entry already exists this month
+    const realSig = new Set(
+      monthExpensesReal.map((r) => `${r.category}|${r.amount}|${r.accountId}`)
+    );
+    return projected.filter((p) => !realSig.has(`${p.category}|${p.amount}|${p.accountId}`));
+  }, [store.expenses, month, monthExpensesReal]);
+
+  const monthExpensesForDisplay = useMemo(
+    () => [...monthExpensesReal, ...monthExpensesProjectedOnly].sort((a, b) => a.date.localeCompare(b.date)),
+    [monthExpensesReal, monthExpensesProjectedOnly]
+  );
+
+  // Totals for cards (we keep REALs for accounting numbers)
+  const expenseThisMonth = useMemo(
+    () => monthExpensesReal.reduce((s, e) => s + e.amount, 0),
+    [monthExpensesReal]
+  );
+
+  const projectedRecurringMonthly = useMemo(() => {
+    // Sum of one period's worth of recurring expenses (just use source rows)
+    return store.expenses
+      .filter((e) => e.isRecurring || e.recurrence?.enabled)
+      .reduce((s, e) => s + e.amount, 0);
+  }, [store.expenses]);
+
+  const netThisMonth = +(incomeThisMonth - expenseThisMonth).toFixed(2);
   const totalAccountBalances = store.accounts.reduce((s, a) => s + a.balance, 0);
 
   // Month-filtered tables
   const monthIncomes = useMemo(
     () => store.incomes.filter((i) => ymKey(i.date) === month),
     [store.incomes, month]
-  );
-  const monthExpenses = useMemo(
-    () => store.expenses.filter((e) => ymKey(e.date) === month),
-    [store.expenses, month]
   );
   const monthAccountTxns = useMemo(
     () => store.accountTxns.filter((t) => ymKey(t.date) === month),
@@ -270,23 +699,37 @@ export default function Page() {
   const projectStats = store.projects.map((p) => {
     const contributed = store.projectContribs.filter((c) => c.projectId === p.id).reduce((s, c) => s + c.amount, 0);
     const remaining = Math.max(0, p.targetAmount - contributed);
-    const monthsLeft = Math.max(1, Math.ceil((new Date(p.targetDate).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24 * 30.4)));
+    const monthsLeft = Math.max(
+      1,
+      Math.ceil((new Date(p.targetDate).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24 * 30.4))
+    );
     const requiredMonthly = +(remaining / monthsLeft).toFixed(2);
     return { project: p, contributed, remaining, monthsLeft, requiredMonthly };
   });
   const requiredForGoalsMonthly = projectStats.reduce((s, x) => s + x.requiredMonthly, 0);
   const availableForGoalsThisMonth = +(netThisMonth - requiredForGoalsMonthly).toFixed(2);
 
-  // Trend data
+  // Trend data (+ Investments line)
   const incomeByMonth = monthlyTotals(store.incomes);
   const expenseByMonth = monthlyTotals(store.expenses);
-  const mergedTrendRaw = Array.from(new Set([...incomeByMonth.map((d) => d.month), ...expenseByMonth.map((d) => d.month)]))
+  const investmentByMonth = monthlyTotals(store.investments);
+
+  const mergedTrendRaw = Array.from(
+    new Set([
+      ...incomeByMonth.map((d) => d.month),
+      ...expenseByMonth.map((d) => d.month),
+      ...investmentByMonth.map((d) => d.month),
+    ])
+  )
     .sort()
     .map((m) => ({
       month: m,
       income: incomeByMonth.find((x) => x.month === m)?.total || 0,
       expenses: expenseByMonth.find((x) => x.month === m)?.total || 0,
-      net: (incomeByMonth.find((x) => x.month === m)?.total || 0) - (expenseByMonth.find((x) => x.month === m)?.total || 0),
+      investments: investmentByMonth.find((x) => x.month === m)?.total || 0,
+      net:
+        (incomeByMonth.find((x) => x.month === m)?.total || 0) -
+        (expenseByMonth.find((x) => x.month === m)?.total || 0),
     }));
 
   const mergedTrend = useMemo(() => {
@@ -312,6 +755,37 @@ export default function Page() {
      Income / Expense CRUD
   --------------------------- */
   const addIncome = (inc: Omit<Income, "id">) => {
+    if (ENABLE_LOCAL_DB) {
+      (async ()=>{
+        try {
+          await fetch('/api/transactions', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ trx_date: inc.date, amount: +inc.amount, description: inc.source, currency: store.currency, account_id: inc.accountId, category_id: null }) });
+          await hydrateFromLocalDb();
+        } catch(e:any){ alert('Add income failed (local DB): '+(e?.message||e)); }
+      })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        try {
+          const resolvedAccountId = await ensureCloudAccountId(workspaceId, inc.accountId);
+          const payload: NewTransaction = {
+            workspace_id: workspaceId,
+            account_id: resolvedAccountId,
+            trx_date: inc.date,
+            amount: +inc.amount,
+            description: inc.source,
+            currency: store.currency,
+            category_id: null,
+          };
+          await addTransactionSupabase(payload);
+          await hydrateFromSupabase(workspaceId);
+        } catch (e: any) {
+          console.error("Add income failed", e);
+          alert(`Add income failed: ${e?.message || e}`);
+        }
+      })();
+      return;
+    }
     const id = mkId();
     const income: Income = { ...inc, id };
     setStore((s) => {
@@ -334,6 +808,19 @@ export default function Page() {
   };
 
   const delIncome = (id: Id) => {
+    if (ENABLE_LOCAL_DB) {
+      (async ()=>{
+        try{ await fetch(`/api/transactions/${id}`, { method:'DELETE' }); await hydrateFromLocalDb(); }catch(e:any){ alert('Delete income failed (local DB): '+(e?.message||e)); }
+      })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await deleteTransactionSupabase(workspaceId, id);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => {
       const income = s.incomes.find((i) => i.id === id);
       if (!income) return s;
@@ -345,6 +832,34 @@ export default function Page() {
   };
 
   const addExpense = (exp: Omit<Expense, "id">) => {
+    if (ENABLE_LOCAL_DB) {
+      (async ()=>{
+        try{ await fetch('/api/transactions', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ trx_date: exp.date, amount: -Math.abs(exp.amount), description: exp.category, currency: store.currency, account_id: exp.accountId, category_id: null }) }); await hydrateFromLocalDb(); }catch(e:any){ alert('Add expense failed (local DB): '+(e?.message||e)); }
+      })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        try {
+          const resolvedAccountId = await ensureCloudAccountId(workspaceId, exp.accountId);
+          const payload: NewTransaction = {
+            workspace_id: workspaceId,
+            account_id: resolvedAccountId,
+            trx_date: exp.date,
+            amount: -Math.abs(exp.amount),
+            description: exp.category,
+            currency: store.currency,
+            category_id: null,
+          };
+          await addTransactionSupabase(payload);
+          await hydrateFromSupabase(workspaceId);
+        } catch (e: any) {
+          console.error("Add expense failed", e);
+          alert(`Add expense failed: ${e?.message || e}`);
+        }
+      })();
+      return;
+    }
     const id = mkId();
     const expense: Expense = { ...exp, id };
     setStore((s) => {
@@ -367,6 +882,17 @@ export default function Page() {
   };
 
   const delExpense = (id: Id) => {
+    if (ENABLE_LOCAL_DB) {
+      (async ()=>{ try{ await fetch(`/api/transactions/${id}`, { method:'DELETE' }); await hydrateFromLocalDb(); }catch(e:any){ alert('Delete expense failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await deleteTransactionSupabase(workspaceId, id);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => {
       const expense = s.expenses.find((e) => e.id === id);
       if (!expense) return s;
@@ -377,30 +903,193 @@ export default function Page() {
     });
   };
 
-  const addAccount = (acc: Omit<Account, "id">) =>
+  const addAccount = (acc: Omit<Account, "id">) => {
+    if (ENABLE_LOCAL_DB) {
+      (async ()=>{ try{ await fetch('/api/accounts', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: acc.name, type: acc.type, currency: acc.currency, balance: acc.balance }) }); await hydrateFromLocalDb(); }catch(e:any){ alert('Add account failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        try {
+          const payload: NewAccount = {
+            name: acc.name,
+            type: acc.type,
+            currency: acc.currency,
+            balance: acc.balance,
+          };
+          await addAccountSupabase(workspaceId, payload);
+          await hydrateFromSupabase(workspaceId);
+        } catch (e: any) {
+          console.error("Add account failed", e);
+          alert(`Add account failed: ${e?.message || e}`);
+        }
+      })();
+      return;
+    }
     setStore((s) => ({ ...s, accounts: [...s.accounts, { ...acc, id: mkId() }] }));
-  const delAccount = (id: Id) =>
+  };
+  const delAccount = (id: Id) => {
+    if (ENABLE_LOCAL_DB) {
+      (async()=>{ try{ await fetch(`/api/accounts/${id}`, { method:'DELETE' }); await hydrateFromLocalDb(); }catch(e:any){ alert('Delete account failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
     setStore((s) => ({ ...s, accounts: s.accounts.filter((a) => a.id !== id) }));
+  };
 
-  const addProject = (p: Omit<Project, "id">) =>
+  const addProject = (p: Omit<Project, "id">) => {
+    if (ENABLE_LOCAL_DB) {
+      (async()=>{ try{ await fetch('/api/projects', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: p.name, target_amount: p.targetAmount, target_date: p.targetDate, notes: p.notes||null }) }); await hydrateFromLocalDb(); }catch(e:any){ alert('Add project failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        const payload: NewProject = {
+          workspace_id: workspaceId,
+          name: p.name,
+          target_amount: p.targetAmount,
+          target_date: p.targetDate,
+          notes: p.notes ?? null,
+        };
+        await addProjectSupabase(payload);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => ({ ...s, projects: [...s.projects, { ...p, id: mkId() }] }));
-  const delProject = (id: Id) =>
+  };
+  const delProject = (id: Id) => {
+    if (ENABLE_LOCAL_DB) {
+      (async()=>{ try{ await fetch(`/api/projects/${id}`, { method:'DELETE' }); await hydrateFromLocalDb(); }catch(e:any){ alert('Delete project failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await deleteProjectSupabase(workspaceId, id);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => ({
       ...s,
       projects: s.projects.filter((p) => p.id !== id),
       projectContribs: s.projectContribs.filter((c) => c.projectId !== id),
     }));
+  };
 
-  const addProjectContribution = (pc: Omit<ProjectContribution, "id">) =>
+  const addProjectContribution = (pc: Omit<ProjectContribution, "id">) => {
+    if (ENABLE_LOCAL_DB) {
+      (async()=>{ try{ await fetch('/api/project-contributions', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ project_id: pc.projectId, date: pc.date, amount: pc.amount }) }); await hydrateFromLocalDb(); }catch(e:any){ alert('Add contribution failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        const payload: NewProjectContribution = {
+          workspace_id: workspaceId,
+          project_id: pc.projectId,
+          date: pc.date,
+          amount: pc.amount,
+        };
+        await addProjectContributionSupabase(payload);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => ({ ...s, projectContribs: [{ ...pc, id: mkId() }, ...s.projectContribs] }));
-  const delProjectContribution = (id: Id) =>
+  };
+  const delProjectContribution = (id: Id) => {
+    if (ENABLE_LOCAL_DB) {
+      (async()=>{ try{ await fetch(`/api/project-contributions/${id}`, { method:'DELETE' }); await hydrateFromLocalDb(); }catch(e:any){ alert('Delete contribution failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await deleteProjectContributionSupabase(workspaceId, id);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => ({ ...s, projectContribs: s.projectContribs.filter((c) => c.id !== id) }));
+  };
+
+  /* ---------------------------
+     Investments CRUD (affects account if accountId given)
+  --------------------------- */
+  const addInvestment = (v: Omit<Investment, "id">) => {
+    if (ENABLE_LOCAL_DB) {
+      (async()=>{ try{ await fetch('/api/investments', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ inv_date: v.date, instrument: v.instrument, amount: v.amount, account_id: v.accountId||null, notes: v.notes||null }) }); await hydrateFromLocalDb(); }catch(e:any){ alert('Add investment failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await addInvestmentSupabase({
+          workspace_id: workspaceId,
+          account_id: v.accountId ?? null,
+          inv_date: v.date,
+          instrument: v.instrument,
+          amount: v.amount,
+          // notes: v.notes ?? null,
+        });
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
+    const inv: Investment = { ...v, id: mkId() };
+    setStore((s) => {
+      let accounts = s.accounts;
+      if (inv.accountId) {
+        const delta = inv.amount > 0 ? -Math.abs(inv.amount) : Math.abs(inv.amount);
+        accounts = adjust(accounts, inv.accountId, delta);
+      }
+      return { ...s, investments: [inv, ...s.investments], accounts };
+    });
+  };
+  const delInvestment = (id: Id) => {
+    if (ENABLE_LOCAL_DB) {
+      (async()=>{ try{ await fetch(`/api/investments/${id}`, { method:'DELETE' }); await hydrateFromLocalDb(); }catch(e:any){ alert('Delete investment failed (local DB): '+(e?.message||e)); } })();
+      return;
+    }
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await deleteInvestmentSupabase(id);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
+    setStore((s) => {
+      const v = s.investments.find((x) => x.id === id);
+      if (!v) return s;
+      let accounts = s.accounts;
+      if (v.accountId) {
+        // revert balance effect
+        const delta = v.amount > 0 ? +v.amount : -v.amount;
+        accounts = adjust(accounts, v.accountId, delta);
+      }
+      return { ...s, accounts, investments: s.investments.filter((x) => x.id !== id) };
+    });
+  };
 
   /* ---------------------------
      Transfers CRUD + Edit
   --------------------------- */
   const addTransfer = (tr: Omit<Transfer, "id">) => {
     if (tr.fromAccountId === tr.toAccountId || tr.amount <= 0) return;
+    if (cloudOn && workspaceId) {
+      (async () => {
+        const fromId = await ensureCloudAccountId(workspaceId, tr.fromAccountId);
+        const toId = await ensureCloudAccountId(workspaceId, tr.toAccountId);
+        const payload: NewTransfer = {
+          workspace_id: workspaceId,
+          trx_date: tr.date,
+          from_account_id: fromId,
+          to_account_id: toId,
+          amount: tr.amount,
+          notes: tr.notes ?? null,
+        };
+        await addTransferSupabase(payload);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     const id = mkId();
     const transfer: Transfer = { ...tr, id };
     setStore((s) => {
@@ -443,6 +1132,13 @@ export default function Page() {
   };
 
   const delTransfer = (id: Id) => {
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await deleteTransferSupabase(workspaceId, id);
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => {
       const tr = s.transfers.find((t) => t.id === id);
       if (!tr) return s;
@@ -455,6 +1151,19 @@ export default function Page() {
   };
 
   const updateTransfer = (edited: Transfer) => {
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await updateTransferSupabase(workspaceId, edited.id, {
+          trx_date: edited.date,
+          from_account_id: edited.fromAccountId,
+          to_account_id: edited.toAccountId,
+          amount: edited.amount,
+          notes: edited.notes ?? null,
+        });
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => {
       const original = s.transfers.find((t) => t.id === edited.id);
       if (!original) return s;
@@ -503,6 +1212,19 @@ export default function Page() {
   const [editingTransferId, setEditingTransferId] = useState<Id | null>(null);
 
   const updateIncome = (edited: Income) => {
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await updateTransactionSupabase(workspaceId, edited.id, {
+          trx_date: edited.date,
+          account_id: edited.accountId,
+          amount: +edited.amount,
+          description: edited.source,
+          currency: store.currency,
+        });
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => {
       const original = s.incomes.find((i) => i.id === edited.id);
       if (!original) return s;
@@ -527,6 +1249,19 @@ export default function Page() {
   };
 
   const updateExpense = (edited: Expense) => {
+    if (cloudOn && workspaceId) {
+      (async () => {
+        await updateTransactionSupabase(workspaceId, edited.id, {
+          trx_date: edited.date,
+          account_id: edited.accountId,
+          amount: -Math.abs(edited.amount),
+          description: edited.category,
+          currency: store.currency,
+        });
+        await hydrateFromSupabase(workspaceId);
+      })();
+      return;
+    }
     setStore((s) => {
       const original = s.expenses.find((e) => e.id === edited.id);
       if (!original) return s;
@@ -559,6 +1294,88 @@ export default function Page() {
     a.click();
   };
 
+  // Export a self-contained SQL snapshot of local storage data (no RLS/UUID deps)
+  const exportSQL = () => {
+    const q = (s: string | undefined) =>
+      s == null ? "NULL" : `'${String(s).replace(/'/g, "''")}'`;
+    const num = (n: number | undefined | null) => (Number.isFinite(Number(n)) ? String(n) : "NULL");
+
+    const lines: string[] = [];
+    lines.push("-- Budgeting tool SQL snapshot from local storage");
+    lines.push("-- Tables are simplified and omit workspace/constraints for easy inspection");
+    lines.push("");
+    lines.push("-- Accounts");
+    lines.push("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT, type TEXT, currency TEXT, balance REAL);");
+    store.accounts.forEach((a) =>
+      lines.push(
+        `INSERT INTO accounts (id,name,type,currency,balance) VALUES (${q(a.id)}, ${q(a.name)}, ${q(a.type)}, ${q(a.currency)}, ${num(a.balance)});`
+      )
+    );
+    lines.push("");
+    lines.push("-- Transactions (incomes: amount>0, expenses: amount<0)");
+    lines.push(
+      "CREATE TABLE IF NOT EXISTS transactions (id TEXT PRIMARY KEY, trx_date TEXT, amount REAL, description TEXT, currency TEXT, account_id TEXT, category_id TEXT);"
+    );
+    store.incomes.forEach((i) =>
+      lines.push(
+        `INSERT INTO transactions (id,trx_date,amount,description,currency,account_id,category_id) VALUES (${q(i.id)}, ${q(i.date)}, ${num(+i.amount)}, ${q(i.source)}, ${q(store.currency)}, ${q(i.accountId)}, NULL);`
+      )
+    );
+    store.expenses.forEach((e) =>
+      lines.push(
+        `INSERT INTO transactions (id,trx_date,amount,description,currency,account_id,category_id) VALUES (${q(e.id)}, ${q(e.date)}, ${num(-Math.abs(e.amount))}, ${q(e.category)}, ${q(store.currency)}, ${q(e.accountId)}, NULL);`
+      )
+    );
+    lines.push("");
+    lines.push("-- Transfers");
+    lines.push(
+      "CREATE TABLE IF NOT EXISTS transfers (id TEXT PRIMARY KEY, trx_date TEXT, from_account_id TEXT, to_account_id TEXT, amount REAL, notes TEXT);"
+    );
+    store.transfers.forEach((t) =>
+      lines.push(
+        `INSERT INTO transfers (id,trx_date,from_account_id,to_account_id,amount,notes) VALUES (${q(t.id)}, ${q(t.date)}, ${q(t.fromAccountId)}, ${q(t.toAccountId)}, ${num(t.amount)}, ${q(t.notes)});`
+      )
+    );
+    lines.push("");
+    lines.push("-- Projects");
+    lines.push(
+      "CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT, target_amount REAL, target_date TEXT, notes TEXT);"
+    );
+    store.projects.forEach((p) =>
+      lines.push(
+        `INSERT INTO projects (id,name,target_amount,target_date,notes) VALUES (${q(p.id)}, ${q(p.name)}, ${num(p.targetAmount)}, ${q(p.targetDate)}, ${q(p.notes)});`
+      )
+    );
+    lines.push("");
+    lines.push("-- Project contributions");
+    lines.push(
+      "CREATE TABLE IF NOT EXISTS project_contributions (id TEXT PRIMARY KEY, project_id TEXT, date TEXT, amount REAL);"
+    );
+    store.projectContribs.forEach((c) =>
+      lines.push(
+        `INSERT INTO project_contributions (id,project_id,date,amount) VALUES (${q(c.id)}, ${q(c.projectId)}, ${q(c.date)}, ${num(c.amount)});`
+      )
+    );
+    lines.push("");
+    lines.push("-- Investments (amount>0 contribution, amount<0 withdrawal)");
+    lines.push(
+      "CREATE TABLE IF NOT EXISTS investments (id TEXT PRIMARY KEY, inv_date TEXT, instrument TEXT, amount REAL, account_id TEXT, notes TEXT);"
+    );
+    store.investments.forEach((v) =>
+      lines.push(
+        `INSERT INTO investments (id,inv_date,instrument,amount,account_id,notes) VALUES (${q(v.id)}, ${q(v.date)}, ${q(v.instrument)}, ${num(v.amount)}, ${q(v.accountId)}, ${q(v.notes)});`
+      )
+    );
+
+    const sql = lines.join("\n");
+    const blob = new Blob([sql], { type: "application/sql" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `budgeting_data_${new Date().toISOString().slice(0, 10)}.sql`;
+    a.click();
+  };
+
   const importJSON = async (file: File) => {
     const text = await file.text();
     const incoming = JSON.parse(text) as Store;
@@ -569,9 +1386,24 @@ export default function Page() {
     if (confirm("Reset all data?")) setStore(emptyStore);
   };
 
+  // Cloud auth gate
+  const needsAuth = ENABLE_CLOUD && !userEmail;
+
   /* ---------------------------
      Render
   --------------------------- */
+  if (!hydrated || authChecking) {
+    return <div className="min-h-screen w-full flex items-center justify-center text-sm text-muted-foreground">Loading...</div>;
+  }
+
+  if (needsAuth) {
+    return (
+      <div className="min-h-screen w-full flex items-center justify-center p-6">
+        <AuthCard onSignedIn={bootstrapSupabase} />
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen w-full p-4 md:p-8">
       <div className="noise-overlay">
@@ -600,7 +1432,36 @@ export default function Page() {
               </SelectContent>
             </Select>
 
+            <div className="px-2 py-1 rounded-md border text-xs" title={userEmail || undefined} style={{ borderColor: "var(--border)" }}>
+              {cloudOn ? (
+                <span>Cloud: On{userEmail ? ` • ${userEmail}` : ""}</span>
+              ) : (
+                <span>Cloud: Off</span>
+              )}
+            </div>
+            <div className="flex items-center gap-2 text-xs">
+              <Label className="text-xs">Derived balances</Label>
+              <Switch checked={deriveBalances} onCheckedChange={(v)=>{ setDeriveBalances(!!v); if (workspaceId) hydrateFromSupabase(workspaceId); }} />
+            </div>
+            <Button
+              variant="outline"
+              onClick={() => { if (workspaceId) hydrateFromSupabase(workspaceId); }}
+              disabled={!workspaceId || cloudLoading}
+              title="Refresh from cloud"
+              className="border-border"
+            >
+              <RefreshCw className={`h-4 w-4 ${cloudLoading ? "animate-spin" : ""}`} />
+            </Button>
+            {cloudOn && (
+              <Button variant="outline" onClick={async ()=>{ await signOut(); setCloudOn(false); setWorkspaceId(null); setUserEmail(null); }} title="Sign out" className="border-border">
+                Sign out
+              </Button>
+            )}
+
             <Button variant="outline" onClick={exportJSON} title="Export data JSON" className="border-border">
+              <Download className="h-4 w-4" />
+            </Button>
+            <Button variant="outline" onClick={exportSQL} title="Export SQL snapshot" className="border-border">
               <Download className="h-4 w-4" />
             </Button>
             <label
@@ -625,9 +1486,15 @@ export default function Page() {
           </div>
         </div>
 
+        {cloudError && (
+          <div className="mb-4 rounded-xl border border-destructive/30 bg-destructive/10 text-destructive px-4 py-3 text-sm">
+            Cloud error: {cloudError}. You can keep using local data; try signing out/in or check workspace permissions.
+          </div>
+        )}
+
         {/* Main */}
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-          <TabsList className="grid grid-cols-5 md:w-[800px]">
+          <TabsList className="grid grid-cols-6 md:w-[1000px]">
             <TabsTrigger value="dashboard" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
               Dashboard
             </TabsTrigger>
@@ -642,6 +1509,9 @@ export default function Page() {
             </TabsTrigger>
             <TabsTrigger value="projects" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
               Projects/Goals
+            </TabsTrigger>
+            <TabsTrigger value="investments" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
+              Investments
             </TabsTrigger>
           </TabsList>
 
@@ -704,6 +1574,7 @@ export default function Page() {
                         <Legend />
                         <Line type="monotone" dataKey="income" name="Income" stroke="#16a34a" strokeWidth={2.6} dot={false} />
                         <Line type="monotone" dataKey="expenses" name="Expenses" stroke="#ef4444" strokeWidth={2.6} dot={false} />
+                        <Line type="monotone" dataKey="investments" name="Investments" stroke="#a855f7" strokeWidth={2.6} dot={false} />
                         <Line type="monotone" dataKey="net" name="Net" stroke="#2563eb" strokeWidth={2.6} dot={false} strokeDasharray="5 5" />
                       </LineChart>
                     </ResponsiveContainer>
@@ -798,23 +1669,33 @@ export default function Page() {
                   )}
                   <TableList
                     headers={["Date", "Category", "Account", "Amount", "Recurring", "Notes", "Actions"]}
-                    rows={monthExpenses.map((e) => [
+                    rows={monthExpensesForDisplay.map((e) => [
                       e.date,
                       e.category,
                       store.accounts.find((a) => a.id === e.accountId)?.name || "—",
                       fmt(e.amount, currency),
-                      e.isRecurring ? "Yes" : "No",
+                      e.isRecurring || e.recurrence?.enabled ? (e.recurrence?.period ? e.recurrence.period : "Yes") : "No",
                       e.notes || "—",
                       <div className="flex items-center gap-1" key={e.id}>
-                        <Button variant="ghost" size="icon" onClick={() => setEditingExpenseId(e.id)} title="Edit">
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button variant="ghost" size="icon" onClick={() => delExpense(e.id)} title="Delete">
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                        {!String(e.id).includes("__proj__") && (
+                          <>
+                            <Button variant="ghost" size="icon" onClick={() => setEditingExpenseId(e.id)} title="Edit">
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                            <Button variant="ghost" size="icon" onClick={() => delExpense(e.id)} title="Delete">
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </>
+                        )}
+                        {String(e.id).includes("__proj__") && (
+                          <span className="text-xs text-muted-foreground">(Projected)</span>
+                        )}
                       </div>,
                     ])}
                   />
+                  <div className="text-xs text-muted-foreground mt-3">
+                    Projected rows come from recurring settings and do not affect balances until actually recorded.
+                  </div>
                 </CardContent>
               </Card>
             </div>
@@ -951,12 +1832,36 @@ export default function Page() {
               </Card>
             </div>
           </TabsContent>
+
+          {/* INVESTMENTS */}
+          <TabsContent value="investments" className="mt-6">
+            <div className="grid md:grid-cols-3 gap-4">
+              <CaptureInvestment onAdd={addInvestment} currency={currency} accounts={store.accounts} />
+              <Card className="md:col-span-2 rounded-2xl card-glow">
+                <CardHeader>
+                  <CardTitle>Investments (All)</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <TableList
+                    headers={["Date", "Instrument", "Account", "Amount", "Notes", "Actions"]}
+                    rows={store.investments.map((v) => [
+                      v.date,
+                      v.instrument,
+                      v.accountId ? (store.accounts.find((a) => a.id === v.accountId)?.name || "—") : "—",
+                      fmt(v.amount, currency),
+                      v.notes || "—",
+                      <Button key={v.id} variant="ghost" size="icon" onClick={() => delInvestment(v.id)}>
+                        <Trash2 className="h-4 w-4" />
+                      </Button>,
+                    ])}
+                  />
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
         </Tabs>
 
-        {/* --- Supabase sanity check panel (can remove later) --- */}
-        <div className="mt-10">
-          <SupabaseTestPanel/>
-        </div>
+        {/* Auth panel removed in favor of header controls */}
       </div>
     </div>
   );
@@ -1016,6 +1921,7 @@ function TableList({ headers, rows }: { headers: string[]; rows: React.ReactNode
     </div>
   );
 }
+
 /* ===========================
    Forms
 =========================== */
@@ -1106,17 +2012,41 @@ function CaptureExpense({
   const [notes, setNotes] = useState("");
   const [isRecurring, setRecurring] = useState(false);
 
+  // NEW recurrence UI
+  const [recEnabled, setRecEnabled] = useState(false);
+  const [recPeriod, setRecPeriod] = useState<RecurrencePeriod>("monthly");
+  const [recStart, setRecStart] = useState(todayISO());
+  const [recEnd, setRecEnd] = useState<string>("");
+
   useEffect(() => {
     if (!accountId && accounts[0]) setAccountId(accounts[0].id);
   }, [accounts]);
 
+  useEffect(() => {
+    // keep simple toggle in sync
+    setRecurring(recEnabled);
+  }, [recEnabled]);
+
   const add = () => {
     if (!category || !amount || !accountId) return;
-    onAdd({ category, amount: parseNum(amount), date, notes, isRecurring, accountId });
+    const base: Omit<Expense, "id"> = {
+      category,
+      amount: parseNum(amount),
+      date,
+      notes,
+      isRecurring,
+      accountId,
+      recurrence: recEnabled ? { enabled: true, period: recPeriod, start: recStart, end: recEnd || undefined } : undefined,
+    };
+    onAdd(base);
     setCategory("");
     setAmount("");
     setNotes("");
     setRecurring(false);
+    setRecEnabled(false);
+    setRecPeriod("monthly");
+    setRecStart(todayISO());
+    setRecEnd("");
   };
 
   return (
@@ -1137,13 +2067,44 @@ function CaptureExpense({
           <Label>Date</Label>
           <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
         </div>
-        <div className="flex items-center justify-between">
-          <div>
-            <Label className="mr-2">Recurring?</Label>
-            <div className="text-xs text-muted-foreground">Include in monthly projection</div>
+
+        {/* Recurrence */}
+        <div className="rounded-xl border p-3 space-y-3" style={{ borderColor: "var(--border)" }}>
+          <div className="flex items-center justify-between">
+            <div>
+              <Label className="mr-2">Recurring?</Label>
+              <div className="text-xs text-muted-foreground">Will auto-project into future months</div>
+            </div>
+            <Switch checked={recEnabled} onCheckedChange={setRecEnabled} />
           </div>
-          <Switch checked={isRecurring} onCheckedChange={setRecurring} />
+
+          {recEnabled && (
+            <div className="grid grid-cols-2 gap-3">
+              <div className="grid gap-2">
+                <Label>Period</Label>
+                <Select value={recPeriod} onValueChange={(v) => setRecPeriod(v as RecurrencePeriod)}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select period" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="monthly">Monthly</SelectItem>
+                    <SelectItem value="quarterly">Quarterly</SelectItem>
+                    <SelectItem value="annually">Annually</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-2">
+                <Label>Start</Label>
+                <Input type="date" value={recStart} onChange={(e) => setRecStart(e.target.value)} />
+              </div>
+              <div className="grid gap-2">
+                <Label>End (optional)</Label>
+                <Input type="date" value={recEnd} onChange={(e) => setRecEnd(e.target.value)} />
+              </div>
+            </div>
+          )}
         </div>
+
         <div className="grid gap-2">
           <Label>Paid from Account</Label>
           <Select value={accountId} onValueChange={setAccountId}>
@@ -1424,6 +2385,93 @@ function CaptureProjectContribution({
 }
 
 /* ===========================
+   Investments Form
+=========================== */
+function CaptureInvestment({
+  onAdd,
+  currency,
+  accounts,
+}: {
+  onAdd: (v: Omit<Investment, "id">) => void;
+  currency: Currency;
+  accounts: Account[];
+}) {
+  const [instrument, setInstrument] = useState("");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [accountId, setAccountId] = useState<string>(accounts[0]?.id || "");
+  const [isContribution, setIsContribution] = useState(true);
+  const [notes, setNotes] = useState("");
+
+  useEffect(() => {
+    if (!accountId && accounts[0]) setAccountId(accounts[0].id);
+  }, [accounts]);
+
+  const add = () => {
+    const amt = parseNum(amount || "0");
+    if (!instrument || !amt) return;
+    const signed = isContribution ? +amt : -amt;
+    onAdd({ instrument, amount: signed, date, accountId, notes });
+    setInstrument("");
+    setAmount("");
+    setNotes("");
+    setIsContribution(true);
+  };
+
+  return (
+    <Card className="rounded-2xl card-glow">
+      <CardHeader>
+        <CardTitle>Record Investment</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid gap-2">
+          <Label>Instrument</Label>
+          <Input value={instrument} onChange={(e) => setInstrument(e.target.value)} placeholder="e.g., MMF, Bonds, ETF" />
+        </div>
+        <div className="grid gap-2">
+          <Label>Amount ({currency})</Label>
+          <Input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
+        </div>
+        <div className="grid gap-2">
+          <Label>Date</Label>
+          <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        </div>
+        <div className="grid gap-2">
+          <Label>Funded From Account</Label>
+          <Select value={accountId} onValueChange={setAccountId}>
+            <SelectTrigger>
+              <SelectValue placeholder="Select account" />
+            </SelectTrigger>
+            <SelectContent>
+              {accounts.map((a) => (
+                <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="flex items-center justify-between rounded-lg border px-3 py-2">
+          <div className="text-sm">
+            <div className="font-medium">{isContribution ? "Contribution" : "Withdrawal"}</div>
+            <div className="text-xs text-muted-foreground">
+              Contribution reduces the funding account; Withdrawal increases it.
+            </div>
+          </div>
+          <Switch checked={isContribution} onCheckedChange={setIsContribution} />
+        </div>
+        <div className="grid gap-2">
+          <Label>Notes</Label>
+          <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional" />
+        </div>
+        <Button onClick={add} className="w-full btn-gradient">
+          <Plus className="h-4 w-4 mr-2" />
+          Add Investment
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ===========================
    Edit Forms
 =========================== */
 function EditIncomeForm({
@@ -1509,7 +2557,10 @@ function EditExpenseForm({
   const [date, setDate] = useState(expense.date);
   const [accountId, setAccountId] = useState(expense.accountId);
   const [notes, setNotes] = useState(expense.notes || "");
-  const [isRecurring, setRecurring] = useState(expense.isRecurring);
+  const [recEnabled, setRecEnabled] = useState<boolean>(expense.recurrence?.enabled ?? expense.isRecurring);
+  const [recPeriod, setRecPeriod] = useState<RecurrencePeriod>(expense.recurrence?.period ?? "monthly");
+  const [recStart, setRecStart] = useState<string>(expense.recurrence?.start ?? expense.date);
+  const [recEnd, setRecEnd] = useState<string>(expense.recurrence?.end ?? "");
 
   return (
     <Card className="mb-4 rounded-2xl border-2">
@@ -1538,20 +2589,59 @@ function EditExpenseForm({
             </SelectContent>
           </Select>
         </div>
+
+        {/* Recurrence */}
         <div className="grid gap-2">
           <Label>Recurring?</Label>
-          <div className="flex items-center justify-between rounded-lg border px-3 py-2">
-            <span className="text-sm text-muted-foreground">Include in monthly projection</span>
-            <Switch checked={isRecurring} onCheckedChange={setRecurring} />
+          <div className="rounded-lg border px-3 py-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-muted-foreground">Auto-project into future months</span>
+              <Switch checked={recEnabled} onCheckedChange={setRecEnabled} />
+            </div>
+            {recEnabled && (
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <div className="grid gap-1">
+                  <Label className="text-xs">Period</Label>
+                  <Select value={recPeriod} onValueChange={(v) => setRecPeriod(v as RecurrencePeriod)}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="monthly">Monthly</SelectItem>
+                      <SelectItem value="quarterly">Quarterly</SelectItem>
+                      <SelectItem value="annually">Annually</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-1">
+                  <Label className="text-xs">Start</Label>
+                  <Input type="date" value={recStart} onChange={(e) => setRecStart(e.target.value)} />
+                </div>
+                <div className="grid gap-1 col-span-2">
+                  <Label className="text-xs">End (optional)</Label>
+                  <Input type="date" value={recEnd} onChange={(e) => setRecEnd(e.target.value)} />
+                </div>
+              </div>
+            )}
           </div>
         </div>
+
         <div className="grid gap-2 md:col-span-5">
           <Label>Notes</Label>
           <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} />
         </div>
         <div className="flex items-center gap-2 md:col-span-5">
           <Button
-            onClick={() => onSave({ ...expense, category, amount: parseNum(amount), date, accountId, notes, isRecurring })}
+            onClick={() =>
+              onSave({
+                ...expense,
+                category,
+                amount: parseNum(amount),
+                date,
+                accountId,
+                notes,
+                isRecurring: recEnabled,
+                recurrence: recEnabled ? { enabled: true, period: recPeriod, start: recStart, end: recEnd || undefined } : undefined,
+              })
+            }
             className="btn-gradient"
           >
             <Check className="h-4 w-4 mr-2" />
@@ -1646,94 +2736,51 @@ function EditTransferForm({
 /* ===========================
    Supabase Test Panel (no extra "use client")
 =========================== */
-function SupabaseTestPanel() {
+function AuthCard({ onSignedIn }: { onSignedIn: () => Promise<void> }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [workspaceId, setWorkspaceId] = useState<string>("");
-  const [log, setLog] = useState<string>("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const logLine = (s: string) =>
-    setLog((prev) => `${new Date().toLocaleTimeString()}  ${s}\n` + prev);
+  const doSignIn = async () => {
+    try {
+      setBusy(true); setError(null);
+      await signIn(email, password);
+      await onSignedIn();
+    } catch (e: any) {
+      setError(e?.message || "Failed to sign in");
+    } finally { setBusy(false); }
+  };
+  const doSignUp = async () => {
+    try {
+      setBusy(true); setError(null);
+      await signUp(email, password);
+      await onSignedIn();
+    } catch (e: any) {
+      setError(e?.message || "Failed to sign up");
+    } finally { setBusy(false); }
+  };
 
   return (
-    <div style={{ marginTop: 32, padding: 16, border: "1px solid #ddd", borderRadius: 8 }}>
-      <h3>Supabase Test</h3>
-
-      <div style={{ display: "grid", gap: 8, maxWidth: 420, marginTop: 8 }}>
-        <input placeholder="email" value={email} onChange={(e)=>setEmail(e.target.value)} />
-        <input placeholder="password" type="password" value={password} onChange={(e)=>setPassword(e.target.value)} />
-
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={async () => { await signUp(email, password); logLine("SignUp OK"); }}>Sign Up</button>
-          <button onClick={async () => { await signIn(email, password); logLine("SignIn OK"); }}>Sign In</button>
-          <button onClick={async () => { const u = await getUser(); logLine("User: " + (u?.email ?? "none")); }}>Get User</button>
-          <button onClick={async () => { await signOut(); logLine("Signed out"); }}>Sign Out</button>
+    <Card className="w-full max-w-sm rounded-2xl">
+      <CardHeader>
+        <CardTitle>Sign in to continue</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid gap-2">
+          <Label>Email</Label>
+          <Input type="email" value={email} onChange={(e)=>setEmail(e.target.value)} />
         </div>
-
-        <button onClick={async () => {
-          const id = await ensureWorkspace("My Budget");
-          setWorkspaceId(id);
-          logLine("Workspace: " + id);
-        }}>
-          Ensure Workspace
-        </button>
-
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button
-            onClick={async () => {
-              if (!workspaceId) { logLine("No workspace—click Ensure Workspace first"); return; }
-              await addAccountSupabase(workspaceId, { name: "Cash (SB)", type: "Wallet", currency: "USD", balance: 0 });
-              logLine("Account added");
-            }}
-          >
-            Add Account
-          </button>
-
-          <button
-            onClick={async () => {
-              if (!workspaceId) { logLine("No workspace"); return; }
-              const accts = await listAccountsSupabase(workspaceId);
-              logLine("Accounts: " + JSON.stringify(accts));
-            }}
-          >
-            List Accounts
-          </button>
-
-          <button
-            onClick={async () => {
-              if (!workspaceId) { logLine("No workspace"); return; }
-              const accts = await listAccountsSupabase(workspaceId);
-              if (accts.length === 0) { logLine("No accounts yet"); return; }
-              await addTransactionSupabase({
-                workspace_id: workspaceId,
-                account_id: accts[0].id,
-                trx_date: new Date().toISOString().slice(0,10),
-                amount: -12.5,
-                description: "Test coffee",
-                currency: "USD",
-                category_id: null,
-              });
-              logLine("Transaction inserted");
-            }}
-          >
-            Add Sample Transaction
-          </button>
-
-          <button
-            onClick={async () => {
-              if (!workspaceId) { logLine("No workspace"); return; }
-              const tx = await listTransactionsSupabase(workspaceId, 10);
-              logLine("Last 10 tx: " + JSON.stringify(tx));
-            }}
-          >
-            List Transactions
-          </button>
+        <div className="grid gap-2">
+          <Label>Password</Label>
+          <Input type="password" value={password} onChange={(e)=>setPassword(e.target.value)} />
         </div>
-      </div>
-
-      <pre style={{ marginTop: 12, background: "#111", color: "#0f0", padding: 12, borderRadius: 6, maxHeight: 220, overflow: "auto" }}>
-        {log || "Logs will appear here…"}
-      </pre>
-    </div>
+        {error && <div className="text-sm text-red-500">{error}</div>}
+        <div className="flex gap-2">
+          <Button className="flex-1" onClick={doSignIn} disabled={busy}>Sign In</Button>
+          <Button className="flex-1" variant="outline" onClick={doSignUp} disabled={busy}>Sign Up</Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
