@@ -917,7 +917,7 @@ const addIncome = (inc: Omit<Income, "id">) => {
           inv_date: v.date,
           instrument: v.instrument,
           amount: v.amount,
-          notes: v.notes ?? null,
+          notes: v.notes ?? undefined,
         });
         await hydrateFromSupabase(workspaceId);
       })();
