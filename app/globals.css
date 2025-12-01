@@ -1,0 +1,162 @@
+@import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+/* enable `.dark` variant for shadcn */
+@custom-variant dark (&:is(.dark *));
+
+/* Map Tailwind tokens to CSS vars for shadcn/ui */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover, var(--card));
+  --color-popover-foreground: var(--popover-foreground, var(--card-foreground));
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-destructive: var(--destructive, #ef4444);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* ============================
+   ELECTRIC PURPLE – lively variant
+   ============================ */
+:root {
+  /* Text & surfaces */
+  --foreground: #fbfaff;
+  --card: rgba(255, 255, 255, 0.10);
+  --card-foreground: #ffffff;
+  --popover: rgba(255, 255, 255, 0.10);
+  --popover-foreground: #ffffff;
+
+  /* Brand / accents (bright!) */
+  --primary: #b26bff;                /* electric purple */
+  --primary-foreground: #170026;
+  --secondary: #7c3aed;              /* vivid violet */
+  --secondary-foreground: #ffffff;
+  --accent: #ff67f9;                 /* magenta glow */
+  --accent-foreground: #160018;
+
+  /* Borders & inputs */
+  --muted: rgba(255, 255, 255, 0.12);
+  --muted-foreground: #e9d5ff;
+  --border: rgba(255, 255, 255, 0.22);
+  --input: rgba(255, 255, 255, 0.12);
+  --ring: #c084fc;
+
+  --radius: 0.9rem;
+}
+
+/* Dark just nudges contrast; background is handled by aurora layers */
+.dark {
+  --foreground: #fff8ff;
+  --card: rgba(255, 255, 255, 0.09);
+  --card-foreground: #ffffff;
+  --popover: rgba(255, 255, 255, 0.1);
+  --popover-foreground: #ffffff;
+
+  --primary: #c084fc;
+  --primary-foreground: #140022;
+  --secondary: #8b5cf6;
+  --secondary-foreground: #ffffff;
+  --accent: #ff8cfb;
+  --accent-foreground: #160018;
+
+  --muted: rgba(255, 255, 255, 0.12);
+  --muted-foreground: #e9d5ff;
+  --border: rgba(255, 255, 255, 0.20);
+  --input: rgba(255, 255, 255, 0.12);
+  --ring: #d6b4ff;
+}
+
+/* ==== AURORA BACKGROUND (animated & lively) ==== */
+@layer base {
+  * { @apply border-border outline-ring/50; }
+
+  body {
+    color: var(--foreground);
+    min-height: 100vh;
+    background: radial-gradient(1200px 800px at 10% -10%, #3b0a7a 0%, transparent 60%),
+                radial-gradient(1000px 700px at 100% 0%, #1b144b 0%, transparent 65%),
+                linear-gradient(180deg, #120024 0%, #0d011b 100%);
+    background-attachment: fixed;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    position: relative;
+    overflow-x: hidden;
+  }
+
+  /* moving aurora blobs */
+  body::before,
+  body::after {
+    content: "";
+    position: fixed;
+    inset: -20% -20% auto auto;
+    width: 80vmax;
+    height: 80vmax;
+    background:
+      radial-gradient(closest-side, rgba(178,107,255,0.28), transparent 60%) 30% 30% / 55% 55% no-repeat,
+      radial-gradient(closest-side, rgba(255,103,249,0.22), transparent 60%) 70% 40% / 45% 45% no-repeat,
+      radial-gradient(closest-side, rgba(124,58,237,0.25), transparent 60%) 45% 70% / 50% 50% no-repeat;
+    filter: blur(35px);
+    z-index: -1;
+    animation: float-aurora 18s infinite linear alternate;
+  }
+  body::after {
+    inset: auto auto -25% -20%;
+    animation-duration: 22s;
+    animation-direction: alternate-reverse;
+    opacity: 0.85;
+  }
+
+  /* soft grain to avoid flatness */
+  body::backdrop { background: transparent; }
+  .noise-overlay::before {
+    content: "";
+    pointer-events: none;
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140' viewBox='0 0 140 140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/ filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+    z-index: -1;
+  }
+}
+
+@keyframes float-aurora {
+  0%   { transform: translate3d(-3%, -2%, 0) scale(1); }
+  50%  { transform: translate3d(2%, 1%, 0) scale(1.06); }
+  100% { transform: translate3d(4%, 3%, 0) scale(1.1); }
+}
+
+/* Livelier cards & buttons */
+@layer components {
+  .card-glow {
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.06) inset,
+      0 10px 30px rgba(178,107,255,0.18),
+      0 2px 10px rgba(0,0,0,0.25);
+    backdrop-filter: blur(10px);
+  }
+  .btn-gradient {
+    background-image: linear-gradient(135deg, var(--primary) 0%, #ff67f9 100%);
+    color: var(--primary-foreground);
+  }
+  .btn-gradient:hover { filter: saturate(1.1) brightness(1.05); }
+}
