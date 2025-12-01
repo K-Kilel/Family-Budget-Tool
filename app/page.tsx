@@ -913,7 +913,7 @@ const addIncome = (inc: Omit<Income, "id">) => {
       (async () => {
         await addInvestmentSupabase({
           workspace_id: workspaceId,
-          account_id: v.accountId ?? null,
+          account_id: v.accountId ?? undefined,
           inv_date: v.date,
           instrument: v.instrument,
           amount: v.amount,
